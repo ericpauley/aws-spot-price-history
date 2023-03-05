@@ -27,7 +27,7 @@ When fetching spot instance pricing from AWS, results contain some prices from t
 euw3-az2        g4dn.4xlarge    Linux/UNIX      0.558600        2023-01-01T00:00:00+00:00
 ```
 
-For data from 2022-01 and before, this data was fetched more than one month at a time. This should have no negative impact unless, for example, an instance type was retired before the month began (and there should therefore be no price).
+For data from 2023-01 and before, this data was fetched more than one month at a time. This should have no negative impact unless, for example, an instance type was retired before the month began (and there should therefore be no price). These older files also only contain default regions. Data from 2023-02 and later contains all regions, including opt-in regions.
 
 # Using data
 
