@@ -1,0 +1,32 @@
+name: Pull Updated Prices
+
+on:
+  schedule:
+    # * is a special character in YAML so you have to quote this string
+    - cron:  '0 6 1 * *'
+  workflow_dispatch:
+
+jobs:
+  Pull-Prices:
+    runs-on: ubuntu-latest
+    permissions:
+      # Give the default GITHUB_TOKEN write permission to commit and push the
+      # added or changed files to the repository.
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip' # caching pip dependencies
+      - run: pip install -r requirements.txt
+      - shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWSAccessKeyId }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWSSecretAccessKey }}
+        run: |
+          python3 collect.py
+      - uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_message: Pull updated spot prices
+          file_pattern: '*.tsv.zst'
