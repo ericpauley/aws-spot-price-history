@@ -108,7 +108,7 @@ def fetch_recent_data():
         for start, end in zip(date_buckets, date_buckets[1:])
         for region in regions["Regions"]
     ]
-    p: multiprocessing.Pool = multiprocessing.Pool(32)
+    p: multiprocessing.Pool = multiprocessing.Pool(os.getenv("MAX_PROCESSES", default=8))
     print(f"Starting {len(jobs)} jobs... E.g., ", jobs[:3])
     rs = p.starmap_async(get_spot_prices, jobs, chunksize=1)
     p.close()  # No more work
