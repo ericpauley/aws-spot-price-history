@@ -1,5 +1,7 @@
 # AWS Spot Price History
 
+*Update:* This dataset is now hosted on Zenodo: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14198917.svg)](https://doi.org/10.5281/zenodo.14198917)
+
 This repository tracks historical prices for AWS spot prices across all regions. It is updated automatically on the 1st of each month to contain data from the previous month.
 
 # Data format
