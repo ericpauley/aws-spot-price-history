@@ -5,12 +5,10 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -28,6 +26,11 @@ import (
 )
 
 const zenodoURL = "https://zenodo.org"
+
+const (
+	zenodoMaxAttempts = 6
+	zenodoRetryBase   = 10 * time.Second
+)
 
 var limiters = make(map[string]*rate.Limiter)
 var limiterMutex sync.Mutex
@@ -241,49 +244,102 @@ func doZenodoRequest(ctx context.Context, method, path string, request interface
 	if strings.HasPrefix(path, "/") {
 		return doZenodoRequest(ctx, method, zenodoURL+path, request, result)
 	}
-	u, err := url.Parse(path)
-	if err != nil {
-		return err
-	}
-	u.RawQuery = url.Values{"access_token": {os.Getenv("ZENODO_ACCESS_TOKEN")}}.Encode()
-	var body io.Reader
+	var rawBody []byte
+	contentType := ""
 	if request != nil {
 		if raw, ok := request.([]byte); ok {
 			log.Println("Uploading raw body")
-			body = bytes.NewReader(raw)
+			rawBody = raw
+			contentType = "application/octet-stream"
 		} else {
+			contentType = "application/json"
 			var b bytes.Buffer
 			if err := json.NewEncoder(&b).Encode(request); err != nil {
 				return err
 			}
-			// log.Println("Body: ", b.String())
-			body = &b
+			rawBody = b.Bytes()
 		}
-
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
+	var lastErr error
+	for attempt := 0; attempt < zenodoMaxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(1<<uint(attempt-1)) * zenodoRetryBase
+			log.Printf("Zenodo request %s %s failed (%v), retrying in %s", method, path, lastErr, delay)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		var retry bool
+		retry, lastErr = doZenodoRequestOnce(ctx, method, path, rawBody, contentType, result)
+		if lastErr == nil || !retry {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+// doZenodoRequestOnce performs a single request. The returned bool reports
+// whether the error is transient and the request should be retried.
+func doZenodoRequestOnce(ctx context.Context, method, url string, rawBody []byte, contentType string, result interface{}) (bool, error) {
+	var body io.Reader
+	if contentType != "" {
+		body = bytes.NewReader(rawBody)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
-		return err
+		return false, err
+	}
+	// Send the token as a header rather than a query parameter: Zenodo now
+	// redirects some endpoints (e.g. /versions/latest), and a query parameter
+	// would be dropped on the redirect while the header is preserved.
+	if token := os.Getenv("ZENODO_ACCESS_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "aws-spot-price-history (https://github.com/ericpauley/aws-spot-price-history)")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return true, err
 	}
-	// log.Println(resp)
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return true, fmt.Errorf("reading response from %s %s: %w", method, url, err)
+	}
+	isJSON := strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json")
+	transient := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 	if resp.StatusCode >= 400 {
 		var zenodoError ZenodoError
-		if err := json.NewDecoder(resp.Body).Decode(&zenodoError); err != nil {
-			return err
+		if isJSON && json.Unmarshal(respBody, &zenodoError) == nil && zenodoError.Message != "" {
+			return transient, fmt.Errorf("%s %s: HTTP %d: %s", method, url, resp.StatusCode, zenodoError.Message)
 		}
-		return errors.New(zenodoError.Message)
+		return transient, fmt.Errorf("%s %s: HTTP %d (%s): %s", method, url, resp.StatusCode, resp.Header.Get("Content-Type"), snippet(respBody))
 	}
 	if result == nil {
-		return nil
+		return false, nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
-		return err
+	if !isJSON {
+		// An HTML page with a 2xx status is almost always a proxy/maintenance
+		// page standing in for the API; treat it as transient.
+		return true, fmt.Errorf("%s %s: HTTP %d returned non-JSON response (%s): %s", method, url, resp.StatusCode, resp.Header.Get("Content-Type"), snippet(respBody))
 	}
-	return nil
+	if err := json.Unmarshal(respBody, result); err != nil {
+		return false, fmt.Errorf("%s %s: decoding response: %w: %s", method, url, err, snippet(respBody))
+	}
+	return false, nil
+}
+
+func snippet(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > 300 {
+		s = s[:300] + "..."
+	}
+	return s
 }
 
 func getLatestZenodoVersion(ctx context.Context) (*ZenodoVersion, error) {
