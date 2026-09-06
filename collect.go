@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -28,8 +30,9 @@ import (
 const zenodoURL = "https://zenodo.org"
 
 const (
-	zenodoMaxAttempts = 6
-	zenodoRetryBase   = 10 * time.Second
+	regionProbeTimeout = 2 * time.Minute
+	zenodoMaxAttempts  = 6
+	zenodoRetryBase    = 10 * time.Second
 )
 
 var limiters = make(map[string]*rate.Limiter)
@@ -97,25 +100,13 @@ type SpotPriceRequest struct {
 var spotPriceRequestProgress = make(map[SpotPriceRequest]float64)
 var spotPriceRequestMutex sync.Mutex
 
-func getSpotPrices(ctx context.Context, region string, start time.Time, end time.Time) ([]SpotPrice, error) {
+func getSpotPrices(ctx context.Context, region *regionClient, start time.Time, end time.Time) ([]SpotPrice, error) {
 	spotPriceRequestMutex.Lock()
-	spotPriceRequestProgress[SpotPriceRequest{region, start, end}] = 0
+	spotPriceRequestProgress[SpotPriceRequest{region.name, start, end}] = 0
 	spotPriceRequestMutex.Unlock()
-	limiter := getLimiter(region)
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-	if err != nil {
-		panic("configuration error, " + err.Error())
-	}
-	svc := ec2.NewFromConfig(cfg)
-
-	zones, err := svc.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{AllAvailabilityZones: aws.Bool(true)})
-	if err != nil {
-		return nil, err
-	}
-	zoneIdMapping := make(map[string]string)
-	for _, zone := range zones.AvailabilityZones {
-		zoneIdMapping[*zone.ZoneName] = *zone.ZoneId
-	}
+	limiter := getLimiter(region.name)
+	svc := region.svc
+	zoneIdMapping := region.zoneIDs
 
 	var prices []SpotPrice
 	paginator := ec2.NewDescribeSpotPriceHistoryPaginator(svc, &ec2.DescribeSpotPriceHistoryInput{
@@ -135,7 +126,7 @@ func getSpotPrices(ctx context.Context, region string, start time.Time, end time
 		if len(page.SpotPriceHistory) != 0 {
 			progress := end.Sub(*page.SpotPriceHistory[0].Timestamp).Seconds() / end.Sub(start).Seconds()
 			spotPriceRequestMutex.Lock()
-			spotPriceRequestProgress[SpotPriceRequest{region, start, end}] = progress
+			spotPriceRequestProgress[SpotPriceRequest{region.name, start, end}] = progress
 			spotPriceRequestMutex.Unlock()
 		}
 		for _, price := range page.SpotPriceHistory {
@@ -150,9 +141,88 @@ func getSpotPrices(ctx context.Context, region string, start time.Time, end time
 		}
 	}
 	spotPriceRequestMutex.Lock()
-	spotPriceRequestProgress[SpotPriceRequest{region, start, end}] = 1
+	spotPriceRequestProgress[SpotPriceRequest{region.name, start, end}] = 1
 	spotPriceRequestMutex.Unlock()
 	return prices, nil
+}
+
+// regionClient holds a ready-to-use EC2 client for a region along with the
+// zone name -> zone ID mapping needed to normalise spot price records.
+type regionClient struct {
+	name    string
+	svc     *ec2.Client
+	zoneIDs map[string]string
+}
+
+// isUnreachable reports whether err is a network-level failure (DNS, dial,
+// TLS or I/O timeout) rather than an API error. Regions that are entirely
+// offline surface as these errors.
+func isUnreachable(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// probeRegion builds an EC2 client for the region and fetches its zone ID
+// mapping. It is used both to detect regions that are completely unreachable
+// and to avoid re-fetching the mapping for every collection request.
+func probeRegion(ctx context.Context, region string) (*regionClient, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("configuration error: %w", err)
+	}
+	svc := ec2.NewFromConfig(cfg)
+	probeCtx, cancel := context.WithTimeout(ctx, regionProbeTimeout)
+	defer cancel()
+	zones, err := svc.DescribeAvailabilityZones(probeCtx, &ec2.DescribeAvailabilityZonesInput{AllAvailabilityZones: aws.Bool(true)})
+	if err != nil {
+		return nil, err
+	}
+	zoneIDs := make(map[string]string)
+	for _, zone := range zones.AvailabilityZones {
+		zoneIDs[*zone.ZoneName] = *zone.ZoneId
+	}
+	return &regionClient{name: region, svc: svc, zoneIDs: zoneIDs}, nil
+}
+
+// probeRegions probes every region concurrently. Regions that cannot be
+// reached at the network level (e.g. a full regional outage) are logged and
+// dropped; any other error is returned.
+func probeRegions(ctx context.Context, regions []string) ([]*regionClient, []string, error) {
+	type result struct {
+		client *regionClient
+		err    error
+	}
+	results := make([]result, len(regions))
+	var wg sync.WaitGroup
+	for i, region := range regions {
+		wg.Add(1)
+		go func(i int, region string) {
+			defer wg.Done()
+			client, err := probeRegion(ctx, region)
+			results[i] = result{client, err}
+		}(i, region)
+	}
+	wg.Wait()
+
+	var clients []*regionClient
+	var skipped []string
+	for i, region := range regions {
+		r := results[i]
+		if r.err == nil {
+			clients = append(clients, r.client)
+			continue
+		}
+		if isUnreachable(r.err) {
+			log.Printf("WARNING: region %s is unreachable and will be skipped: %v", region, r.err)
+			skipped = append(skipped, region)
+			continue
+		}
+		return nil, nil, fmt.Errorf("probing region %s: %w", region, r.err)
+	}
+	if len(clients) == 0 {
+		return nil, nil, errors.New("no regions reachable")
+	}
+	return clients, skipped, nil
 }
 
 func getEC2Regions(ctx context.Context) ([]string, error) {
@@ -425,9 +495,17 @@ func GetApplicableDateRanges(ver ZenodoVersion) []time.Time {
 
 func main() {
 	ctx := context.Background()
-	regions, err := getEC2Regions(ctx)
+	regionNames, err := getEC2Regions(ctx)
 	if err != nil {
 		log.Fatal(err)
+	}
+	regions, skippedRegions, err := probeRegions(ctx, regionNames)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Collecting from %d regions", len(regions))
+	if len(skippedRegions) > 0 {
+		log.Printf("WARNING: skipping unreachable regions: %s", strings.Join(skippedRegions, ", "))
 	}
 	version, err := getLatestZenodoVersion(context.Background())
 	if err != nil {
@@ -455,11 +533,11 @@ func main() {
 		for start := month; start.Before(AddMonths(month, 1)); start = start.Add(24 * time.Hour) {
 			for _, region := range regions {
 				wg.Add(1)
-				go func(region string) {
+				go func(region *regionClient) {
 					defer wg.Done()
 					prices, err := getSpotPrices(ctx, region, start, start.Add(24*time.Hour))
 					if err != nil {
-						log.Fatal(err, region)
+						log.Fatal(err, " ", region.name)
 						return
 					}
 					priceResults <- prices
@@ -560,6 +638,9 @@ func main() {
 			log.Fatal("Failed to upload", err)
 		}
 		log.Println("Uploaded", month, response)
+	}
+	if len(skippedRegions) > 0 {
+		log.Printf("WARNING: data for unreachable regions is missing from this upload: %s", strings.Join(skippedRegions, ", "))
 	}
 	if os.Getenv("ZENODO_PUBLISH") == "publish" {
 		log.Println("Publishing")
