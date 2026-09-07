@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -12,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -459,6 +462,221 @@ func setZenodoMeta(ctx context.Context, draftID int, meta map[string]interface{}
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// On-disk spill and merge.
+//
+// A month of spot prices is tens of millions of rows, which does not fit in
+// the memory of a hosted CI runner if held as Go structs. Each (day, region)
+// request is therefore sorted and written to its own zstd-compressed chunk
+// file as soon as it finishes; chunks are then k-way merged per day, and the
+// day files are k-way merged into the final output. Memory use is bounded by
+// a single request's rows plus a handful of read buffers.
+// ---------------------------------------------------------------------------
+
+var chunkEncoderPool = sync.Pool{New: func() interface{} {
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithWindowSize(1<<20))
+	if err != nil {
+		panic(err)
+	}
+	return enc
+}}
+
+// writeSortedChunk sorts prices and writes them to path as a compressed,
+// tab-separated file. Rows are ordered by SpotPrice.Compare so that files
+// can later be merged without re-sorting.
+func writeSortedChunk(path string, prices []SpotPrice) error {
+	slices.SortFunc(prices, func(i, j SpotPrice) int { return i.Compare(j) })
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := chunkEncoderPool.Get().(*zstd.Encoder)
+	defer chunkEncoderPool.Put(enc)
+	enc.Reset(f)
+	w := bufio.NewWriterSize(enc, 256*1024)
+	for _, p := range prices {
+		if err := writeChunkRow(w, p); err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+func writeChunkRow(w *bufio.Writer, p SpotPrice) error {
+	var buf [24]byte
+	if _, err := w.Write(strconv.AppendInt(buf[:0], p.Time.UnixNano(), 10)); err != nil {
+		return err
+	}
+	for _, field := range []string{p.ZoneID, p.Type, p.OS, p.Price} {
+		if err := w.WriteByte('\t'); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(field); err != nil {
+			return err
+		}
+	}
+	return w.WriteByte('\n')
+}
+
+func parseChunkRow(line string) (SpotPrice, error) {
+	fields := strings.Split(line, "\t")
+	if len(fields) != 5 {
+		return SpotPrice{}, fmt.Errorf("malformed chunk row %q", line)
+	}
+	ns, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return SpotPrice{}, fmt.Errorf("malformed chunk timestamp %q: %w", fields[0], err)
+	}
+	return SpotPrice{
+		Time:   time.Unix(0, ns).UTC(),
+		ZoneID: fields[1],
+		Type:   fields[2],
+		OS:     fields[3],
+		Price:  fields[4],
+	}, nil
+}
+
+// chunkReader streams one sorted chunk file.
+type chunkReader struct {
+	file    *os.File
+	dec     *zstd.Decoder
+	scanner *bufio.Scanner
+	cur     SpotPrice
+}
+
+func openChunk(path string) (*chunkReader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	dec, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true))
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sc := bufio.NewScanner(dec)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	return &chunkReader{file: f, dec: dec, scanner: sc}, nil
+}
+
+// next advances to the following row; it returns false at end of file.
+func (c *chunkReader) next() (bool, error) {
+	if !c.scanner.Scan() {
+		return false, c.scanner.Err()
+	}
+	p, err := parseChunkRow(c.scanner.Text())
+	if err != nil {
+		return false, err
+	}
+	c.cur = p
+	return true, nil
+}
+
+func (c *chunkReader) close() {
+	c.dec.Close()
+	c.file.Close()
+}
+
+type chunkHeap []*chunkReader
+
+func (h chunkHeap) Len() int            { return len(h) }
+func (h chunkHeap) Less(i, j int) bool  { return h[i].cur.Compare(h[j].cur) < 0 }
+func (h chunkHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *chunkHeap) Push(x interface{}) { *h = append(*h, x.(*chunkReader)) }
+func (h *chunkHeap) Pop() interface{} {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
+// mergeChunks streams the rows of the given sorted chunk files in global
+// sorted order, dropping exact duplicates, and calls emit for each row.
+func mergeChunks(paths []string, emit func(SpotPrice) error) (int, error) {
+	h := &chunkHeap{}
+	for _, path := range paths {
+		r, err := openChunk(path)
+		if err != nil {
+			return 0, err
+		}
+		ok, err := r.next()
+		if err != nil {
+			r.close()
+			return 0, fmt.Errorf("%s: %w", path, err)
+		}
+		if !ok {
+			r.close()
+			continue
+		}
+		heap.Push(h, r)
+	}
+	defer func() {
+		for _, r := range *h {
+			r.close()
+		}
+	}()
+	rows := 0
+	var last SpotPrice
+	haveLast := false
+	for h.Len() > 0 {
+		r := (*h)[0]
+		if !haveLast || r.cur.Compare(last) != 0 {
+			if err := emit(r.cur); err != nil {
+				return rows, err
+			}
+			last = r.cur
+			haveLast = true
+			rows++
+		}
+		ok, err := r.next()
+		if err != nil {
+			return rows, err
+		}
+		if ok {
+			heap.Fix(h, 0)
+		} else {
+			heap.Pop(h)
+			r.close()
+		}
+	}
+	return rows, nil
+}
+
+// mergeChunksToFile merges chunk files into a new compressed chunk file.
+func mergeChunksToFile(paths []string, out string) (int, error) {
+	f, err := os.Create(out)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	enc := chunkEncoderPool.Get().(*zstd.Encoder)
+	defer chunkEncoderPool.Put(enc)
+	enc.Reset(f)
+	w := bufio.NewWriterSize(enc, 256*1024)
+	rows, err := mergeChunks(paths, func(p SpotPrice) error { return writeChunkRow(w, p) })
+	if err != nil {
+		return rows, err
+	}
+	if err := w.Flush(); err != nil {
+		return rows, err
+	}
+	if err := enc.Close(); err != nil {
+		return rows, err
+	}
+	return rows, f.Close()
+}
+
 func AddMonths(t time.Time, months int) time.Time {
 	year, month, _ := t.Date()
 	return time.Date(year, time.Month(int(month)+months), 1, 0, 0, 0, 0, time.UTC)
@@ -528,26 +746,56 @@ func main() {
 			}
 			continue
 		}
-		priceResults := make(chan []SpotPrice, 1000000)
+		monthEnd := AddMonths(month, 1)
+		tmpDir, err := os.MkdirTemp("", "spot-"+month.Format("2006-01")+"-")
+		if err != nil {
+			log.Fatal(err)
+		}
+		type chunk struct {
+			day  int
+			path string
+		}
+		chunks := make(chan chunk, len(regions)*32)
 		wg := sync.WaitGroup{}
-		for start := month; start.Before(AddMonths(month, 1)); start = start.Add(24 * time.Hour) {
+		day := 0
+		for start := month; start.Before(monthEnd); start = start.Add(24 * time.Hour) {
 			for _, region := range regions {
 				wg.Add(1)
-				go func(region *regionClient) {
+				go func(day int, start time.Time, region *regionClient) {
 					defer wg.Done()
 					prices, err := getSpotPrices(ctx, region, start, start.Add(24*time.Hour))
 					if err != nil {
 						log.Fatal(err, " ", region.name)
 						return
 					}
-					priceResults <- prices
-				}(region)
+					// Normalise rows to the month before spilling: drop rows
+					// past the end of the month and clamp the pre-month price
+					// that AWS returns to the start of the month.
+					kept := prices[:0]
+					for _, p := range prices {
+						if !p.Time.Before(monthEnd) {
+							continue
+						}
+						if p.Time.Before(month) {
+							p.Time = month
+						}
+						kept = append(kept, p)
+					}
+					path := filepath.Join(tmpDir, fmt.Sprintf("d%02d-%s.zst", day, region.name))
+					if err := writeSortedChunk(path, kept); err != nil {
+						log.Fatal("Failed to write chunk ", path, ": ", err)
+						return
+					}
+					chunks <- chunk{day, path}
+				}(day, start, region)
 			}
+			day++
 		}
+		numDays := day
 
 		go func() {
 			wg.Wait()
-			close(priceResults)
+			close(chunks)
 		}()
 
 		monitorContext, cancelMonitor := context.WithCancel(ctx)
@@ -567,56 +815,56 @@ func main() {
 			}
 		}()
 
-		var allPrices []SpotPrice
-
-		for prices := range priceResults {
-			allPrices = append(allPrices, prices...)
+		chunksByDay := make([][]string, numDays)
+		for c := range chunks {
+			chunksByDay[c.day] = append(chunksByDay[c.day], c.path)
 		}
 		cancelMonitor()
-		log.Println("Sorting")
-		slices.SortFunc(allPrices, func(i, j SpotPrice) int {
-			return i.Compare(j)
-		})
+
+		// First level: merge each day's per-region chunks into one file per
+		// day, keeping the number of simultaneously open files small.
+		log.Println("Merging daily chunks")
+		dayFiles := make([]string, 0, numDays)
+		for d, paths := range chunksByDay {
+			out := filepath.Join(tmpDir, fmt.Sprintf("day%02d.zst", d))
+			if _, err := mergeChunksToFile(paths, out); err != nil {
+				log.Fatal("Failed to merge day ", d, ": ", err)
+			}
+			for _, p := range paths {
+				os.Remove(p)
+			}
+			dayFiles = append(dayFiles, out)
+		}
+
+		// Second level: merge the day files straight into the final output.
 		var out bytes.Buffer
-		log.Println("Compressing")
+		log.Println("Merging and compressing")
 		zstw, err := zstd.NewWriter(&out, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
 		if err != nil {
 			log.Fatal(err)
 		}
 		enc := csv.NewWriter(zstw)
 		enc.Comma = '\t'
-		var lastRow SpotPrice
-		for _, price := range allPrices {
-			if !price.Time.Before(AddMonths(month, 1)) {
-				// Don't include prices from other months
-				continue
-			}
-			if price.Time.Before(month) {
-				price.Time = month
-			}
-			if price.Compare(lastRow) == 0 {
-				continue
-			}
-			lastRow = price
-			row := []string{price.ZoneID, price.Type, price.OS, price.Price, price.Time.Format(time.RFC3339)}
-			if err := enc.Write(row); err != nil {
-				log.Fatal(err)
-			}
+		rows, err := mergeChunks(dayFiles, func(price SpotPrice) error {
+			return enc.Write([]string{price.ZoneID, price.Type, price.OS, price.Price, price.Time.Format(time.RFC3339)})
+		})
+		if err != nil {
+			log.Fatal("Failed to merge month: ", err)
 		}
 		enc.Flush()
+		if err := enc.Error(); err != nil {
+			log.Fatal(err)
+		}
 		if err := zstw.Close(); err != nil {
 			log.Fatal(err)
 		}
+		os.RemoveAll(tmpDir)
 		collectedPrices[mapKey] = out.Bytes()
 		log.Println("Writing to", mapKey)
 		if err := os.WriteFile(mapKey, out.Bytes(), 0644); err != nil {
 			log.Fatal(err)
 		}
-		// priceSlice := maps.Keys(allPrices)
-		// sort.Slice(priceSlice, func(i, j int) bool {
-		// 	return priceSlice[i].Time.Before(priceSlice[j].Time)
-		// })
-		log.Println("Collected", len(allPrices), "prices")
+		log.Println("Collected", rows, "prices")
 	}
 	log.Println("Uploading to Zenodo")
 
